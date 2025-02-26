@@ -10124,3 +10124,80 @@ void llama_perf_context_reset(struct llama_context * ctx) {
     ctx->t_eval_us   = ctx->n_eval = 0;
     ctx->t_p_eval_us = ctx->n_p_eval = 0;
 }
+
+void llama_simple_chat_set_log_level_to_error_only() {
+    // only print errors
+    llama_log_set([](enum ggml_log_level level, const char * text, void * /* user_data */) {
+        if (level >= GGML_LOG_LEVEL_ERROR) {
+            fprintf(stderr, "%s", text);
+        }
+    }, nullptr);
+}
+
+struct llama_simple_chat * llama_simple_chat_init(const char * model_path,
+                                                  int32_t n_gpu_layers,
+                                                  uint32_t context_size,
+                                                  float min_p,
+                                                  size_t min_keep,
+                                                  float temperature) {
+    // load dynamic backends
+    ggml_backend_load_all();
+
+    // initialize the model
+    llama_model_params model_params = llama_model_default_params();
+    model_params.n_gpu_layers = n_gpu_layers;
+
+    llama_model * model = llama_model_load_from_file(model_path, model_params);
+    if (!model) {
+        fprintf(stderr , "%s: error: unable to load model\n" , __func__);
+        return nullptr;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    // initialize the context
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = context_size;
+    ctx_params.n_batch = context_size;
+
+    llama_context * ctx = llama_init_from_model(model, ctx_params);
+    if (!ctx) {
+        fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
+        return nullptr;
+    }
+
+    // initialize the sampler
+    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_min_p(min_p, min_keep));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+
+    struct llama_simple_chat * chat = new llama_simple_chat {
+        .ctx = ctx,
+        .vocab = vocab,
+        .smpl = smpl
+    };
+
+    return chat;
+}
+
+const char * llama_simple_chat_prompt(struct llama_simple_chat * chat, const char * user_input) {
+
+}
+
+void llama_simple_chat_free(struct llama_simple_chat * chat) {
+    struct llama_sampler * smpl = chat->smpl;
+    struct llama_context * ctx = chat->ctx;
+    struct llama_model * model = chat->model;
+    // std::vector<llama_chat_message> messages = chat->messages;
+
+    // free resources
+    // for (auto & msg : messages) {
+    //     free(const_cast<char *>(msg.content));
+    // }
+    llama_sampler_free(smpl);
+    llama_free(ctx);
+    llama_model_free(model);
+
+    free(chat);
+}

@@ -1331,6 +1331,30 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
+    // Simple API for chat
+    struct llama_simple_chat {
+        struct llama_context * ctx;
+        const struct llama_vocab * vocab;
+        struct llama_sampler * smpl;
+        struct llama_model * model;
+        // std::vector<llama_chat_message> messages;
+        // std::vector<char> formatted;
+        int prev_len;
+    };
+
+    LLAMA_API void llama_simple_chat_set_log_level_to_error_only(void);
+
+    LLAMA_API struct llama_simple_chat * llama_simple_chat_init(const char * model_path,
+                                                  int32_t n_gpu_layers,
+                                                  uint32_t context_size,
+                                                  float min_p,
+                                                  size_t min_keep,
+                                                  float temperature);
+
+    LLAMA_API const char * llama_simple_chat_prompt(struct llama_simple_chat * chat, const char * user_input);
+
+    LLAMA_API void llama_simple_chat_free(struct llama_simple_chat * chat);
+
 #ifdef __cplusplus
 }
 #endif
