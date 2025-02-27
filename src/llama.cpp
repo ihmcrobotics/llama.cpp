@@ -10210,7 +10210,7 @@ const char * llama_simple_chat_prompt(struct llama_simple_chat * chat, const cha
     // remove previous messages to obtain the prompt to generate the response
     std::string prompt(formatted.begin() + chat->prev_len, formatted.begin() + new_len);
 
-    std::string response;
+    static std::string response;
 
     const bool is_first = llama_get_kv_cache_used_cells(ctx) == 0;
 
@@ -10253,8 +10253,6 @@ const char * llama_simple_chat_prompt(struct llama_simple_chat * chat, const cha
             GGML_ABORT("failed to convert token to piece\n");
         }
         std::string piece(buf, n);
-        printf("%s", piece.c_str());
-        fflush(stdout);
         response += piece;
 
         // prepare the next batch with the sampled token
