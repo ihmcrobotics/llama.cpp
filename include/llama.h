@@ -1337,8 +1337,8 @@ extern "C" {
         const struct llama_vocab * vocab;
         struct llama_sampler * smpl;
         struct llama_model * model;
-        // std::vector<llama_chat_message> messages;
-        // std::vector<char> formatted;
+        void * messages;
+        void * formatted;
         int prev_len;
     };
 
