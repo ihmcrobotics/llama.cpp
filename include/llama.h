@@ -1351,7 +1351,16 @@ extern "C" {
                                                   size_t min_keep,
                                                   float temperature);
 
+    LLAMA_API struct llama_batch * llama_simple_chat_tokenize_batch(bool is_first, const struct llama_vocab * vocab, const char * prompt, size_t prompt_size);
+
     LLAMA_API const char * llama_simple_chat_prompt(struct llama_simple_chat * chat, const char * user_input);
+
+    LLAMA_API const char * llama_simple_chat_get_piece(struct llama_context * ctx,
+                                                       struct llama_sampler * smpl,
+                                                       const struct llama_vocab * vocab,
+                                                       llama_batch batch);
+
+    LLAMA_API void llama_simple_chat_decode(struct llama_context * ctx, llama_batch batch);
 
     LLAMA_API void llama_simple_chat_free(struct llama_simple_chat * chat);
 
