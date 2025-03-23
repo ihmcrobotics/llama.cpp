@@ -10124,3 +10124,230 @@ void llama_perf_context_reset(struct llama_context * ctx) {
     ctx->t_eval_us   = ctx->n_eval = 0;
     ctx->t_p_eval_us = ctx->n_p_eval = 0;
 }
+
+void llama_simple_chat_set_log_level_to_error_only() {
+    // only print errors
+    llama_log_set([](enum ggml_log_level level, const char * text, void * /* user_data */) {
+        if (level >= GGML_LOG_LEVEL_ERROR) {
+            fprintf(stderr, "%s", text);
+        }
+    }, nullptr);
+}
+
+struct llama_simple_chat * llama_simple_chat_init(const char * model_path,
+                                                  int32_t n_gpu_layers,
+                                                  uint32_t context_size,
+                                                  float min_p,
+                                                  size_t min_keep,
+                                                  float temperature) {
+    // load dynamic backends
+    ggml_backend_load_all();
+
+    // initialize the model
+    llama_model_params model_params = llama_model_default_params();
+    model_params.n_gpu_layers = n_gpu_layers;
+
+    llama_model * model = llama_model_load_from_file(model_path, model_params);
+    if (!model) {
+        fprintf(stderr , "%s: error: unable to load model\n" , __func__);
+        return nullptr;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    // initialize the context
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = context_size;
+    ctx_params.n_batch = context_size;
+
+    llama_context * ctx = llama_init_from_model(model, ctx_params);
+    if (!ctx) {
+        fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
+        return nullptr;
+    }
+
+    // initialize the sampler
+    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_min_p(min_p, min_keep));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+
+    struct llama_simple_chat * chat = new llama_simple_chat {
+        .ctx = ctx,
+        .vocab = vocab,
+        .smpl = smpl,
+        .model = model,
+        .messages = static_cast<void*>(new std::vector<llama_chat_message>()),
+        .formatted = static_cast<void*>(new std::vector<char>(llama_n_ctx(ctx))),
+        .prev_len = 0
+    };
+
+    return chat;
+}
+
+struct llama_batch * llama_simple_chat_tokenize_batch(bool is_first, const struct llama_vocab * vocab, const char * prompt, size_t prompt_size) {
+    // tokenize the prompt
+    const int n_prompt_tokens = -llama_tokenize(vocab, prompt, prompt_size, NULL, 0, is_first, true);
+    std::vector<llama_token> prompt_tokens(n_prompt_tokens);
+    if (llama_tokenize(vocab, prompt, prompt_size, prompt_tokens.data(), prompt_tokens.size(), is_first, true) < 0) {
+        GGML_ABORT("failed to tokenize the prompt\n");
+    }
+
+    // prepare a batch for the prompt
+    static struct llama_batch batch = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
+
+    int32_t * token = batch.token;
+
+    // print out the tokens
+    for (int i = 0; i < batch.n_tokens; ++i) {
+        printf("%d ", token[i]);
+    }
+    printf("\n");
+    return &batch;
+}
+
+const char * llama_simple_chat_prompt(struct llama_simple_chat * chat, const char * user_input) {
+    struct llama_context * ctx = chat->ctx;
+    const struct llama_vocab * vocab = chat->vocab;
+    struct llama_sampler * smpl = chat->smpl;
+    struct llama_model * model = chat->model;
+    std::vector<llama_chat_message> messages = *static_cast<std::vector<llama_chat_message>*>(chat->messages);
+    std::vector<char> formatted = *static_cast<std::vector<char>*>(chat->formatted);
+
+    const char * tmpl = llama_model_chat_template(model, /* name */ nullptr);
+
+    // add the user input to the message list and format it
+    messages.push_back({"user", strdup(user_input)});
+    int new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, formatted.data(), formatted.size());
+    if (new_len > (int)formatted.size()) {
+        formatted.resize(new_len);
+        new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, formatted.data(), formatted.size());
+    }
+    if (new_len < 0) {
+        fprintf(stderr, "failed to apply the chat template\n");
+        return nullptr;
+    }
+
+    // remove previous messages to obtain the prompt to generate the response
+    std::string prompt(formatted.begin() + chat->prev_len, formatted.begin() + new_len);
+
+    static std::string response;
+
+    const bool is_first = llama_get_kv_cache_used_cells(ctx) == 0;
+
+    // tokenize the prompt
+    const int n_prompt_tokens = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, is_first, true);
+    std::vector<llama_token> prompt_tokens(n_prompt_tokens);
+    if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), is_first, true) < 0) {
+        GGML_ABORT("failed to tokenize the prompt\n");
+    }
+
+    // prepare a batch for the prompt
+    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
+    llama_token new_token_id;
+    while (true) {
+        // check if we have enough space in the context to evaluate this batch
+        int n_ctx = llama_n_ctx(ctx);
+        int n_ctx_used = llama_get_kv_cache_used_cells(ctx);
+        if (n_ctx_used + batch.n_tokens > n_ctx) {
+            printf("\033[0m\n");
+            fprintf(stderr, "context size exceeded, n_ctx_used: %d, batch.n_tokens: %d, n_ctx: %d\n", n_ctx_used, batch.n_tokens, n_ctx);
+            return nullptr;
+        }
+
+        if (llama_decode(ctx, batch)) {
+            GGML_ABORT("failed to decode\n");
+        }
+
+        // sample the next token
+        new_token_id = llama_sampler_sample(smpl, ctx, -1);
+
+        // is it an end of generation?
+        if (llama_vocab_is_eog(vocab, new_token_id)) {
+            break;
+        }
+
+        // convert the token to a string, print it and add it to the response
+        char buf[256];
+        int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
+        if (n < 0) {
+            GGML_ABORT("failed to convert token to piece\n");
+        }
+        std::string piece(buf, n);
+        response += piece;
+
+        // prepare the next batch with the sampled token
+        batch = llama_batch_get_one(&new_token_id, 1);
+    }
+
+    // add the response to the messages
+    messages.push_back({"assistant", strdup(response.c_str())});
+    chat->prev_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), false, nullptr, 0);
+    if (chat->prev_len < 0) {
+        fprintf(stderr, "failed to apply the chat template\n");
+        return nullptr;
+    }
+
+    return response.c_str();
+}
+
+const char * llama_simple_chat_get_piece(struct llama_context * ctx,
+                                         struct llama_sampler * smpl,
+                                         const struct llama_vocab * vocab,
+                                         llama_batch batch) {
+    // check if we have enough space in the context to evaluate this batch
+    int n_ctx = llama_n_ctx(ctx);
+    int n_ctx_used = llama_get_kv_cache_used_cells(ctx);
+    if (n_ctx_used + batch.n_tokens > n_ctx) {
+        fprintf(stderr, "context size exceeded\n");
+        return nullptr;
+    }
+
+    if (llama_decode(ctx, batch)) {
+        GGML_ABORT("failed to decode\n");
+    }
+
+    // sample the next token
+    llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
+
+    // is it an end of generation?
+    if (llama_vocab_is_eog(vocab, new_token_id)) {
+        return nullptr;
+    }
+
+    // convert the token to a string, print it and add it to the response
+    char buf[256];
+    int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
+    if (n < 0) {
+        GGML_ABORT("failed to convert token to piece\n");
+    }
+    static std::string piece(buf, n);
+
+    // prepare the next batch with the sampled token
+    batch = llama_batch_get_one(&new_token_id, 1);
+
+    return piece.c_str();
+}
+
+void llama_simple_chat_decode(struct llama_context * ctx, llama_batch batch) {
+    if (llama_decode(ctx, batch)) {
+        GGML_ABORT("failed to decode\n");
+    }
+}
+
+void llama_simple_chat_free(struct llama_simple_chat * chat) {
+    struct llama_context * ctx = chat->ctx;
+    struct llama_sampler * smpl = chat->smpl;
+    struct llama_model * model = chat->model;
+    std::vector<llama_chat_message> messages = *static_cast<std::vector<llama_chat_message>*>(chat->messages);
+
+    // free resources
+    for (auto & msg : messages) {
+        free(const_cast<char *>(msg.content));
+    }
+    llama_sampler_free(smpl);
+    llama_free(ctx);
+    llama_model_free(model);
+
+    free(chat);
+}
